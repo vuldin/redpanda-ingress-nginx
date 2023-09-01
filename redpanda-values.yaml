@@ -1,0 +1,25 @@
+console:
+  enabled: false
+external:
+  enabled: false
+  domain: local
+listeners:
+  admin:
+    tls:
+      enabled: true
+      cert: external
+  kafka:
+    external:
+      default:
+        advertisedPorts:
+        - 9094
+        tls:
+          enabled: true
+tls:
+  enabled: false
+  certs:
+    default: ~
+    external:
+      secretRef:
+        name: tls-external
+      caEnabled: true
