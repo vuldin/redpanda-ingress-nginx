@@ -1,13 +1,8 @@
 controller:
-  # -- Additional command line arguments to pass to Ingress-Nginx Controller
-  # E.g. to specify the default SSL certificate you can use
   extraArgs:
-  ## extraArgs:
-  ##   default-ssl-certificate: "<namespace>/<secret_name>"
     default-ssl-certificate: "redpanda/tls-external"
     enable-ssl-passthrough: true
-tcp:
-#  <service port>:<namespace/service name>:[PROXY]:[PROXY]
-#  8080: "default/example-tcp-svc:9000"
-#  9094: "redpanda/redpanda:9094"
-#  9644: "redpanda/redpanda:9644"
+#tcp:
+#  9094: "redpanda/redpanda:9094:kafka"
+#  9644: "redpanda/redpanda:9644:admin"
+

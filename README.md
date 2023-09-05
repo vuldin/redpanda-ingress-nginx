@@ -1,32 +1,135 @@
-Enable LoadBalancer via MetalLB:
+This guide shows how to setup external access through a single Nginx Ingress to a Redpanda cluster deployed onto Kubernetes via the helm chart.
+
+## Prerequisites
+
+You will need [kubectl](https://kubernetes.io/docs/tasks/tools/install-kubectl-linux/) and [rpk](https://docs.redpanda.com/current/get-started/rpk-install/) installed.
+
+You will need a Kubernetes cluster associated with your current kubeconfig context. If you need to set such a cluster up locally, then you can do so by [installing kind](https://kind.sigs.k8s.io/docs/user/quick-start/#installing-from-release-binaries). Once installed, then run the following commands:
+
+```
+kind create cluster --name jlp-cluster --config kind-config.yaml
+```
+
+Your Kubernetes cluster must have a LoadBalancer controller. If you don't already have one, then the following commands will install MetalLB:
 
 ```
 kubectl apply -f https://raw.githubusercontent.com/metallb/metallb/v0.13.10/config/manifests/metallb-native.yaml
 kubectl wait --namespace metallb-system --for=condition=ready pod --selector=app=metallb --timeout=90s
-kubectl apply -f ~/projects/redpanda/kind-config-lb.yaml
+kubectl apply -f kind-config-lb.yaml
 ```
 
-Install ingress-nginx:
+You must also have TLS certificates configured appropriately within a secret named `tls-external` in the namespace where you will deploy Redpanda. In this example, we will use the namespace `redpanda`. If you don't have certificates (or if you want to see how certificates should be turned into the appropriate secret), then follow the commands below to create the secret using self-signed certificates:
 
 ```
-helm upgrade --install ingress-nginx ingress-nginx \
-  --repo https://kubernetes.github.io/ingress-nginx \
-  --namespace ingress-nginx --create-namespace
+./generate-certs.sh
 ```
 
-Wait until ready:
+The above command generates a self-signed certificate/key for Redpanda brokers and the associated certificate authority. These files are located in the `certs` folder:
 
 ```
-kubectl wait --namespace ingress-nginx \
-  --for=condition=ready pod \
-  --selector=app.kubernetes.io/component=controller \
-  --timeout=120s
+> tree certs
+certs
+├── 01.pem
+├── ca.crt
+├── ca.key
+├── node.crt
+└── node.key
+
+0 directories, 5 files
 ```
 
-Add rp-kafka / rp-admin ports to deployment/ingress-nginx-controller:
+If you have your own files, then make sure they are either in the same location and names in the same way, or you must change the following command to match your file locations. The following command will create a secret based on the above file structure that will be used in both the Redpanda helm chart config and the `ingress-nginx` helm chart config:
 
 ```
-        ports:
+kubectl create secret generic tls-external --from-file=ca.crt=certs/ca.crt --from-file=tls.crt=certs/node.crt --from-file=tls.key=certs/node.key --dry-run=client -o yaml > tls-external.yaml
+kubectl create ns redpanda
+kubectl apply -f tls-external.yaml -n redpanda
+```
+
+The secret created above will be called `tls-external`. If you change the name of this secret then make sure to update the values.yaml files for both helm chart deployments.
+
+## Deploy Redpanda
+
+Deploy Redpanda:
+
+```
+helm upgrade --install redpanda redpanda --repo https://charts.redpanda.com -n redpanda --wait --timeout 1h -f redpanda-values.yaml
+```
+
+Verify the kafka port is configured correctly for TLS and advertised listeners:
+
+```
+kubectl exec -it -n redpanda redpanda-0 -c redpanda -- rpk cluster info --brokers localhost:9094 --tls-enabled --tls-truststore /etc/tls/certs/external/ca.crt
+```
+
+You will see the hostnames used as the advertised listener endpoints in the output. The default output is:
+
+```
+CLUSTER
+=======
+redpanda.d68cb2f0-91ad-439c-aa39-4901a508e9ef
+
+BROKERS
+=======
+ID    HOST              PORT
+0*    redpanda-0.local  9094
+1     redpanda-1.local  9094
+2     redpanda-2.local  9094
+```
+
+The domain for these hostnames are based off the `external.domain` value found in [redpanda-values.yaml](./redpanda-values.yaml#L7).
+
+Verify the admin port is configured correctly for TLS:
+
+```
+kubectl exec -it -n redpanda redpanda-0 -c redpanda -- rpk cluster health --api-urls localhost:9644 -X admin.tls.enabled=true -X admin.tls.ca=/etc/tls/certs/external/ca.crt
+```
+
+## Install the Nginx Ingress controller
+
+The first command below installs the community-led Nginx Ingress controller via helm, and the second command waits for the deployment to be ready:
+
+```
+helm upgrade --install ingress-nginx ingress-nginx --repo https://kubernetes.github.io/ingress-nginx --namespace ingress-nginx --create-namespace -f ingress-nginx-values.yaml
+kubectl wait --namespace ingress-nginx --for=condition=ready pod --selector=app.kubernetes.io/component=controller --timeout=120s
+```
+
+Each broker hostname must be resolvable to the external IP of the `ingress-nginx` LoadBalancer service. Get this IP with the following command:
+
+```
+kubectl get svc/ingress-nginx-controller -n ingress-nginx
+```
+
+You will get output similar to the following:
+
+```
+NAME                       TYPE           CLUSTER-IP    EXTERNAL-IP   PORT(S)                      AGE
+ingress-nginx-controller   LoadBalancer   10.96.18.44   172.18.0.10   80:31974/TCP,443:30945/TCP   23m
+```
+
+If you are testing locally, then you can add each broker's hostname to your `/etc/hosts` file. Below are the lines you would add given the IP address above and the default external domain `local`:
+
+```
+> tail -3 /etc/hosts
+172.18.0.10 redpanda-0.local
+172.18.0.10 redpanda-1.local
+172.18.0.10 redpanda-2.local
+```
+
+Edit the deployment with the following command:
+
+```
+kubectl edit deployment.apps/ingress-nginx-controller -n ingress-nginx
+```
+
+Add the following port definitions to the first (and only) container in the `containers` list:
+
+```
+spec:
+  template:
+    spec:
+      containers:
+      - ports:
         - containerPort: 9094
           name: rp-kafka
           protocol: TCP
@@ -35,9 +138,16 @@ Add rp-kafka / rp-admin ports to deployment/ingress-nginx-controller:
           protocol: TCP
 ```
 
-Add externa-rp-kafka / external-rp-admin ports to service/ingress-nginx-controller:
+The deployment will automatically destroy the current pod and bring up a replacement pod with the correct configuration. Now edit the LoadBalancer service with the following command:
 
 ```
+kubectl edit service/ingress-nginx-controller -n ingress-nginx
+```
+
+Add the following port definitions:
+
+```
+spec:
   ports:
   - name: external-rp-kafka
     port: 9094
@@ -47,4 +157,41 @@ Add externa-rp-kafka / external-rp-admin ports to service/ingress-nginx-controll
     port: 9644
     protocol: TCP
     targetPort: rp-admin
+```
+
+## Deploy the Ingress service
+
+You can now deploy the Ingress service into the `redpanda` namespace:
+
+```
+kubectl apply -f redpanda-ingress.yaml
+```
+
+## Configure rpk
+
+Create an rpk profile:
+
+```
+rpk profile create ingress-nginx-redpanda -s brokers=redpanda-0.local:9094 -s tls.ca="$(realpath ./certs/ca.crt)" -s admin.hosts=redpanda-0.local -s admin.tls.ca="$(realpath ./certs/ca.crt)"
+```
+
+Now you should be able to successfully run the following commands:
+
+```
+rpk cluster info
+rpk cluster health
+```
+
+## Cleanup
+
+Delete self-signed certificates:
+
+```
+./delete-certs.sh
+```
+
+If you deployed a local kind cluster and want to delete it, then run the following command. Please note that this will delete the entire Kubernetes cluster (with Redpanda and the Ingress controller included):
+
+```
+kind delete cluster --name jlp-cluster
 ```

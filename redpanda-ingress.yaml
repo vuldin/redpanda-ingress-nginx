@@ -5,51 +5,33 @@ metadata:
   namespace: redpanda
   annotations:
     nginx.ingress.kubernetes.io/stream-snippet: |
+      map $ssl_preread_server_name:$server_port $targetBackend {
+        ~^(?<broker>.+).local:9094$ $broker.redpanda.redpanda.svc.cluster.local.:9094;
+        ~^(?<broker>.+).local:9644$ $broker.redpanda.redpanda.svc.cluster.local.:9644;
+      }
       server {
         listen 9094;
 
         proxy_connect_timeout 1s;
         proxy_timeout 3s;
-        resolver 1.1.1.1;
 
         proxy_pass $targetBackend;
         ssl_preread on;
-      }
-
-      map $ssl_preread_server_name $targetBackend {
-        ~^(?<broker>.+).local$ $broker.redpanda.redpanda.svc.cluster.local.:9094;
       }
       server {
         listen 9644;
 
         proxy_connect_timeout 1s;
         proxy_timeout 3s;
-        resolver 1.1.1.1;
 
         proxy_pass $targetBackend;
         ssl_preread on;
       }
 
-      map $ssl_preread_server_name $targetBackend {
-        ~^(?<broker>.+).local$ $broker.redpanda.redpanda.svc.cluster.local.:9644;
-      }
 spec:
   ingressClassName: nginx
-#    tls:
-#    - hosts:
-#      - redpanda-0.local
-#      - redpanda-1.local
-#      - redpanda-2.local
-#      secretName: tls-external
   rules:
   - host: redpanda-0.local
   - host: redpanda-1.local
   - host: redpanda-2.local
-#    http:
-#      paths:
-#      - path: /
-#        pathType: Prefix
-#        backend:
-#          service:
-#            name: redpanda
 
