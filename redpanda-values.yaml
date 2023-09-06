@@ -6,15 +6,23 @@ external:
   enabled: false
   domain: local
 listeners:
-  admin:
-    tls:
-      enabled: true
-      cert: external
   kafka:
     external:
       default:
         advertisedPorts:
         - 9094
+        tls:
+          enabled: true
+  schemaRegistry:
+    external:
+      default:
+        tls:
+          enabled: true
+  http:
+    external:
+      default:
+        advertisedPorts:
+        - 8083
         tls:
           enabled: true
 tls:

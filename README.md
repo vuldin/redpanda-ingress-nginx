@@ -56,6 +56,10 @@ Deploy Redpanda:
 helm upgrade --install redpanda redpanda --repo https://charts.redpanda.com -n redpanda --wait --timeout 1h -f redpanda-values.yaml
 ```
 
+### Verify Redpanda
+
+> Note: You can skip this section if you have already gone through these steps successfully.
+
 Verify the kafka port is configured correctly for TLS and advertised listeners:
 
 ```
@@ -79,10 +83,70 @@ ID    HOST              PORT
 
 The domain for these hostnames are based off the `external.domain` value found in [redpanda-values.yaml](./redpanda-values.yaml#L7).
 
-Verify the admin port is configured correctly for TLS:
+Verify the admin port is configured correctly for for internal clients:
 
 ```
-kubectl exec -it -n redpanda redpanda-0 -c redpanda -- rpk cluster health --api-urls localhost:9644 -X admin.tls.enabled=true -X admin.tls.ca=/etc/tls/certs/external/ca.crt
+kubectl exec -it -n redpanda redpanda-0 -c redpanda -- rpk cluster health --api-urls localhost:9644
+```
+
+> Note: The admin port is configured for internal clients only, as it would be a security concern if it were made available to external clients. This is also why there is only one admin listener available.
+
+Verify the schema registry port is configured correctly for TLS connections:
+
+```
+kubectl exec -it -n redpanda redpanda-0 -c redpanda -- curl -svk --cacert /etc/tls/certs/external/ca.crt "https://localhost:8084/subjects"
+```
+
+You will see similar output to the following:
+
+```
+*   Trying 127.0.0.1:8084...
+* Connected to localhost (127.0.0.1) port 8084 (#0)
+* ALPN: offers h2,http/1.1
+* TLSv1.3 (OUT), TLS handshake, Client hello (1):
+* TLSv1.3 (IN), TLS handshake, Server hello (2):
+* TLSv1.3 (OUT), TLS change cipher, Change cipher spec (1):
+* TLSv1.3 (OUT), TLS handshake, Client hello (1):
+* TLSv1.3 (IN), TLS handshake, Server hello (2):
+* TLSv1.3 (IN), TLS handshake, Encrypted Extensions (8):
+* TLSv1.3 (IN), TLS handshake, Certificate (11):
+* TLSv1.3 (IN), TLS handshake, CERT verify (15):
+* TLSv1.3 (IN), TLS handshake, Finished (20):
+* TLSv1.3 (OUT), TLS handshake, Finished (20):
+* SSL connection using TLSv1.3 / TLS_AES_128_GCM_SHA256
+* ALPN: server did not agree on a protocol. Uses default.
+* Server certificate:
+*  subject: O=Redpanda
+*  start date: Sep  6 21:08:26 2023 GMT
+*  expire date: Sep  5 21:08:26 2024 GMT
+*  issuer: O=Redpanda; CN=Redpanda CA
+*  SSL certificate verify result: unable to get local issuer certificate (20), continuing anyway.
+* using HTTP/1.x
+> GET /subjects HTTP/1.1
+> Host: localhost:8084
+> User-Agent: curl/7.88.1
+> Accept: */*
+> 
+< HTTP/1.1 200 OK
+< Content-Length: 2
+< Content-Type: application/vnd.schemaregistry.v1+json
+< Date: Wed, 06 Sep 2023 21:34:41 GMT
+< Server: Seastar httpd
+< 
+* Connection #0 to host localhost left intact
+[]
+```
+
+Verify the HTTP proxy endpoint is secured by TLS with the following command:
+
+```
+kubectl exec -it -n redpanda redpanda-0 -c redpanda -- curl --ssl-reqd --cacert /etc/tls/certs/external/ca.crt https://redpanda-0.redpanda.redpanda.svc.cluster.local.:8083/brokers
+```
+
+You will see the following output:
+
+```
+{"brokers":[0,1,2]}
 ```
 
 ## Install the Nginx Ingress controller
@@ -130,11 +194,14 @@ spec:
     spec:
       containers:
       - ports:
+        - containerPort: 8083
+          name: rp-proxy
+          protocol: TCP
+        - containerPort: 8084
+          name: rp-schema
+          protocol: TCP
         - containerPort: 9094
           name: rp-kafka
-          protocol: TCP
-        - containerPort: 9644
-          name: rp-admin
           protocol: TCP
 ```
 
@@ -149,14 +216,18 @@ Add the following port definitions:
 ```
 spec:
   ports:
+  - name: external-rp-proxy
+    port: 8083
+    protocol: TCP
+    targetPort: rp-proxy
+  - name: external-rp-schema
+    port: 8084
+    protocol: TCP
+    targetPort: rp-schema
   - name: external-rp-kafka
     port: 9094
     protocol: TCP
     targetPort: rp-kafka
-  - name: external-rp-admin
-    port: 9644
-    protocol: TCP
-    targetPort: rp-admin
 ```
 
 ## Deploy the Ingress service
@@ -167,19 +238,38 @@ You can now deploy the Ingress service into the `redpanda` namespace:
 kubectl apply -f redpanda-ingress.yaml
 ```
 
-## Configure rpk
+### Validate Nginx Ingress
+
+> Note: You can skip this section if you have already gone through these steps successfully.
 
 Create an rpk profile:
 
 ```
-rpk profile create ingress-nginx-redpanda -s brokers=redpanda-0.local:9094 -s tls.ca="$(realpath ./certs/ca.crt)" -s admin.hosts=redpanda-0.local -s admin.tls.ca="$(realpath ./certs/ca.crt)"
+rpk profile create ingress-nginx-redpanda -s brokers=redpanda-0.local:9094 -s tls.ca="$(realpath ./certs/ca.crt)"
 ```
 
 Now you should be able to successfully run the following commands:
 
 ```
 rpk cluster info
-rpk cluster health
+```
+
+`rpk` commands that make use of the admin port (such as `rpk cluster health`) will not work with your external rpk client, as the admin port is only available within the cluster. Run admin-oriented `rpk` commands in the following way:
+
+```
+kubectl exec -it -n redpanda redpanda-0 -c redpanda -- rpk cluster health
+```
+
+Verify connectivity to the schema endpoint through the Ingress:
+
+```
+curl -svk --cacert certs/ca.crt "https://redpanda-0.local:8084/subjects" 
+```
+
+Verify connectivity to the HTTP proxy endpoint through the Ingress:
+
+```
+curl -sk --cacert certs/ca.crt https://redpanda-0.local:8083/brokers
 ```
 
 ## Cleanup
